@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 from pathlib import Path
@@ -12,6 +13,9 @@ from .config import DEFAULT_HF_REPO_ID, DEFAULT_MODEL_FILENAME, CACHE_DIR
 from .providers import get_providers
 from .preprocess import preprocess_image, PreprocessResult
 from .postprocess import postprocess_depth
+
+
+ort.preload_dlls()
 
 
 @dataclass
@@ -33,7 +37,10 @@ class DepthAnythingV2:
         self.model_path = self._resolve_model_path(model_path, hf_repo_id, filename)
         providers, provider_options = get_providers(prefer_cpu=prefer_cpu)
         sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if prefer_cpu:
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        else:
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(
             str(self.model_path),
             sess_options=sess_options,
@@ -61,7 +68,11 @@ class DepthAnythingV2:
             raise RuntimeError("Model has no outputs")
         inp = inputs[0]
         out = outputs[0]
-        shape = tuple(int(dim) if dim is not None and dim != 'None' else -1 for dim in inp.shape)  # type: ignore
+        shape = tuple(
+            int(dim) if isinstance(dim, int) or (isinstance(dim, str) and dim.isdigit()) else -1
+            for dim in inp.shape
+        )
+
         return ModelInfo(path=self.model_path, input_name=inp.name, output_name=out.name, input_shape=shape)  # type: ignore
 
     def infer(
@@ -88,7 +99,10 @@ class DepthAnythingV2:
         target_size: int = 518,
         output_long_side: Optional[int] = None,
     ) -> np.ndarray:
+        t0 = time.perf_counter()
         pred, prep = self.infer(image, target_size=target_size)
+        t1 = time.perf_counter()
+        print(f"Inference time: {(t1 - t0) * 1000:.2f} ms")
         depth = postprocess_depth(pred, prep, output_long_side=output_long_side)
         return depth
 

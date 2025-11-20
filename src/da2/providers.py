@@ -11,7 +11,7 @@ def get_providers(prefer_cpu: bool = False) -> Tuple[List[str], list]:
     Returns (providers, provider_options)
     """
     if prefer_cpu:
-        return ["CPUExecutionProvider"], []
+        return ["CPUExecutionProvider"], [{}]
 
     available = ort.get_available_providers()
     providers: List[str] = []
