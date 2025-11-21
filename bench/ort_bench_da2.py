@@ -25,7 +25,9 @@ from da2.postprocess import postprocess_depth
 def bench_forward_only(model: DepthAnythingV2, img: Image.Image, size: int, warmup: int, iters: int):
     # Preprocess once (fixed input)
     prep = preprocess_image(img, target_size=size)
-    input_feed = {model.info.input_name: prep.tensor}
+    #input_feed = {model.info.input_name: prep.tensor}
+    dummy = np.random.randn(1, 3, 518, 518).astype(np.float32)
+    input_feed = {model.info.input_name: dummy}
     out_name = model.info.output_name
 
     # Warmup

@@ -83,6 +83,7 @@ class DepthAnythingV2:
         prep = preprocess_image(image, target_size=target_size)
         input_feed = {self.info.input_name: prep.tensor}
         preds = self.session.run([self.info.output_name], input_feed)[0]
+
         # Expect (1,1,H,W) or (1,H,W)
         if preds.ndim == 4:
             preds = preds[:, 0]
@@ -99,10 +100,7 @@ class DepthAnythingV2:
         target_size: int = 518,
         output_long_side: Optional[int] = None,
     ) -> np.ndarray:
-        t0 = time.perf_counter()
         pred, prep = self.infer(image, target_size=target_size)
-        t1 = time.perf_counter()
-        print(f"Inference time: {(t1 - t0) * 1000:.2f} ms")
         depth = postprocess_depth(pred, prep, output_long_side=output_long_side)
         return depth
 
