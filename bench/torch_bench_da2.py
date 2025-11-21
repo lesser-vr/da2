@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+PyTorch benchmark for Depth Anything v2 Small under fixed settings.
+- Device: cuda/cpu (default: cuda)
+- Batch: 1 (fixed)
+- Input size: default 518x518 (fixed-size inputs recommended)
+- AMP: enabled via --amp (default: off)
+- torch.compile: not used
+- channels_last: optional flag (recommended on for recent NVIDIA GPUs)
+
+Model loading:
+- Downloads weights from HF: repo "depth-anything/Depth-Anything-V2-Small",
+  filename "depth_anything_v2_vits.pth".
+- To use the real PyTorch model, provide a model class via env var
+  DA2_TORCH_MODEL_CLASS="module_path:ClassName". The script will instantiate
+  it without args, then try to load the downloaded state_dict.
+- If no class is provided, falls back to a placeholder conv model so you can
+  still run the harness end-to-end.
+
+Results are appended to a CSV with timing statistics.
+"""
+import argparse
+import csv
+import importlib
+import os
+import time
+from statistics import mean, pstdev
+
+import torch
+from huggingface_hub import hf_hub_download
+
+HF_REPO_ID = "depth-anything/Depth-Anything-V2-Small"
+HF_FILENAME = "depth_anything_v2_vits.pth"
+ENV_MODEL_CLASS = "DA2_TORCH_MODEL_CLASS"  # format: "pkg.module:ClassName"
+
+
+class PlaceholderModel(torch.nn.Module):
+    """A lightweight placeholder to keep the harness runnable without the real model."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 64, 3, padding=1),
+            torch.nn.SiLU(inplace=True),
+            torch.nn.Conv2d(64, 64, 3, padding=1),
+            torch.nn.SiLU(inplace=True),
+            torch.nn.Conv2d(64, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def load_model_from_env_or_placeholder() -> torch.nn.Module:
+    spec = os.environ.get(ENV_MODEL_CLASS)
+    if not spec:
+        print(f"[da2:bench] {ENV_MODEL_CLASS} not set. Using PlaceholderModel().")
+        return PlaceholderModel().eval()
+    try:
+        mod_name, cls_name = spec.split(":", 1)
+        mod = importlib.import_module(mod_name)
+        cls = getattr(mod, cls_name)
+        model = cls()  # assumes default ctor; adjust as needed
+        model.eval()
+        return model
+    except Exception as e:
+        print(f"[da2:bench] Failed to import {spec}: {e}. Using PlaceholderModel().")
+        return PlaceholderModel().eval()
+
+
+def maybe_load_state_dict(model: torch.nn.Module, ckpt_path: str) -> None:
+    try:
+        sd = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(sd, dict) and "state_dict" in sd:
+            sd = sd["state_dict"]
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing or unexpected:
+            print(f"[da2:bench] state_dict loaded with missing={len(missing)}, unexpected={len(unexpected)}")
+    except Exception as e:
+        print(f"[da2:bench] Warning: failed to load state_dict from {ckpt_path}: {e}")
+
+
+def bench_once(model, inp, use_amp: bool, device: torch.device):
+    with torch.inference_mode():
+        if device.type == "cuda" and use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                return model(inp)
+        else:
+            return model(inp)
+
+
+def run(device: str, h: int, w: int, warmup: int, iters: int, use_amp: bool, channels_last: bool):
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+
+    # Download weights from HF
+    ckpt = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILENAME)
+
+    # Build model
+    model = load_model_from_env_or_placeholder()
+    maybe_load_state_dict(model, ckpt)
+    model.to(dev)
+
+    if channels_last and dev.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+
+    x = torch.randn(1, 3, h, w, device=dev)
+    if channels_last and dev.type == "cuda":
+        x = x.to(memory_format=torch.channels_last)
+
+    # Warmup
+    if dev.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # fixed-size input -> allow autotune
+        torch.cuda.synchronize()
+    for _ in range(warmup):
+        _ = bench_once(model, x, use_amp, dev)
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Measure
+    lats = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _ = bench_once(model, x, use_amp, dev)
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        lats.append((t1 - t0) * 1000.0)
+
+    return mean(lats), pstdev(lats)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Depth Anything v2 Small (PyTorch) benchmark")
+    ap.add_argument("--height", type=int, default=518)
+    ap.add_argument("--width", type=int, default=518)
+    ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--amp", action="store_true", help="Enable autocast(fp16) on CUDA")
+    ap.add_argument("--channels-last", action="store_true")
+    ap.add_argument("--warmup", type=int, default=30)
+    ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument("--csv", type=str, default="torch_results.csv")
+    ap.add_argument("--tag", type=str, default="")
+    args = ap.parse_args()
+
+    if args.amp:
+        # often beneficial on newer GPUs
+        torch.set_float32_matmul_precision("high")
+
+    avg, std = run(
+        device=args.device,
+        h=args.height,
+        w=args.width,
+        warmup=args.warmup,
+        iters=args.iters,
+        use_amp=args.amp,
+        channels_last=args.channels_last,
+    )
+
+    ips = 1000.0 / avg  # batch=1
+    row = {
+        "tag": args.tag,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+        "device": args.device,
+        "h": args.height,
+        "w": args.width,
+        "amp": args.amp,
+        "channels_last": args.channels_last,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "avg_ms": round(avg, 3),
+        "std_ms": round(std, 3),
+        "throughput_ips": round(ips, 2),
+    }
+
+    print(row)
+
+    write_header = not os.path.exists(args.csv)
+    with open(args.csv, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+if __name__ == "__main__":
+    main()
