@@ -11,61 +11,25 @@ PyTorch benchmark for Depth Anything v2 Small under fixed settings.
 Model loading:
 - Downloads weights from HF: repo "depth-anything/Depth-Anything-V2-Small",
   filename "depth_anything_v2_vits.pth".
-- To use the real PyTorch model, provide a model class via env var
-  DA2_TORCH_MODEL_CLASS="module_path:ClassName". The script will instantiate
-  it without args, then try to load the downloaded state_dict.
-- If no class is provided, falls back to a placeholder conv model so you can
-  still run the harness end-to-end.
+- Uses a built-in placeholder class `da2.torch_model.TorchDepthAnythingV2Small`
+  so you can run without any environment variables. If you later implement the
+  real architecture in that class, the same benchmark will load weights
+  automatically (strict=False) and proceed.
 
 Results are appended to a CSV with timing statistics.
 """
 import argparse
 import csv
-import importlib
 import os
 import time
 from statistics import mean, pstdev
 
 import torch
 from huggingface_hub import hf_hub_download
+from da2.torch_model import TorchDepthAnythingV2Small
 
 HF_REPO_ID = "depth-anything/Depth-Anything-V2-Small"
 HF_FILENAME = "depth_anything_v2_vits.pth"
-ENV_MODEL_CLASS = "DA2_TORCH_MODEL_CLASS"  # format: "pkg.module:ClassName"
-
-
-class PlaceholderModel(torch.nn.Module):
-    """A lightweight placeholder to keep the harness runnable without the real model."""
-
-    def __init__(self):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 64, 3, padding=1),
-            torch.nn.SiLU(inplace=True),
-            torch.nn.Conv2d(64, 64, 3, padding=1),
-            torch.nn.SiLU(inplace=True),
-            torch.nn.Conv2d(64, 1, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-def load_model_from_env_or_placeholder() -> torch.nn.Module:
-    spec = os.environ.get(ENV_MODEL_CLASS)
-    if not spec:
-        print(f"[da2:bench] {ENV_MODEL_CLASS} not set. Using PlaceholderModel().")
-        return PlaceholderModel().eval()
-    try:
-        mod_name, cls_name = spec.split(":", 1)
-        mod = importlib.import_module(mod_name)
-        cls = getattr(mod, cls_name)
-        model = cls()  # assumes default ctor; adjust as needed
-        model.eval()
-        return model
-    except Exception as e:
-        print(f"[da2:bench] Failed to import {spec}: {e}. Using PlaceholderModel().")
-        return PlaceholderModel().eval()
 
 
 def maybe_load_state_dict(model: torch.nn.Module, ckpt_path: str) -> None:
@@ -73,9 +37,17 @@ def maybe_load_state_dict(model: torch.nn.Module, ckpt_path: str) -> None:
         sd = torch.load(ckpt_path, map_location="cpu")
         if isinstance(sd, dict) and "state_dict" in sd:
             sd = sd["state_dict"]
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        if missing or unexpected:
-            print(f"[da2:bench] state_dict loaded with missing={len(missing)}, unexpected={len(unexpected)}")
+        # Try strict=True first (preferred for real model)
+        try:
+            model.load_state_dict(sd, strict=True)
+            print("[da2:bench] state_dict loaded with strict=True")
+            return
+        except Exception as e_strict:
+            print(f"[da2:bench] strict=True load failed: {e_strict}. Retrying with strict=False ...")
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            print(
+                f"[da2:bench] strict=False loaded. missing={len(missing)}, unexpected={len(unexpected)}"
+            )
     except Exception as e:
         print(f"[da2:bench] Warning: failed to load state_dict from {ckpt_path}: {e}")
 
@@ -96,7 +68,7 @@ def run(device: str, h: int, w: int, warmup: int, iters: int, use_amp: bool, cha
     ckpt = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILENAME)
 
     # Build model
-    model = load_model_from_env_or_placeholder()
+    model = TorchDepthAnythingV2Small()
     maybe_load_state_dict(model, ckpt)
     model.to(dev)
 
