@@ -11,10 +11,6 @@ PyTorch benchmark for Depth Anything v2 Small under fixed settings.
 Model loading:
 - Downloads weights from HF: repo "depth-anything/Depth-Anything-V2-Small",
   filename "depth_anything_v2_vits.pth".
-- Uses a built-in placeholder class `da2.torch_model.TorchDepthAnythingV2Small`
-  so you can run without any environment variables. If you later implement the
-  real architecture in that class, the same benchmark will load weights
-  automatically (strict=False) and proceed.
 
 Results are appended to a CSV with timing statistics.
 """
@@ -26,10 +22,23 @@ from statistics import mean, pstdev
 
 import torch
 from huggingface_hub import hf_hub_download
-from da2.torch_model import TorchDepthAnythingV2Small
+from depth_anything_v2.dpt import DepthAnythingV2
 
 HF_REPO_ID = "depth-anything/Depth-Anything-V2-Small"
 HF_FILENAME = "depth_anything_v2_vits.pth"
+
+model_configs = {
+    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+    'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+}
+encoder2name = {
+    'vits': 'Small',
+    'vitb': 'Base',
+    'vitl': 'Large',
+    'vitg': 'Giant',  # we are undergoing company review procedures to release our giant model checkpoint
+}
 
 
 def maybe_load_state_dict(model: torch.nn.Module, ckpt_path: str) -> None:
@@ -64,12 +73,16 @@ def bench_once(model, inp, use_amp: bool, device: torch.device):
 def run(device: str, h: int, w: int, warmup: int, iters: int, use_amp: bool, channels_last: bool):
     dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
 
+    encoder = 'vits'
+    model_name = encoder2name[encoder]
+
     # Download weights from HF
-    ckpt = hf_hub_download(repo_id=HF_REPO_ID, filename=HF_FILENAME)
+    filepath = hf_hub_download(repo_id=f"depth-anything/Depth-Anything-V2-{model_name}",
+                               filename=f"depth_anything_v2_{encoder}.pth", repo_type="model")
 
     # Build model
-    model = TorchDepthAnythingV2Small()
-    maybe_load_state_dict(model, ckpt)
+    model = DepthAnythingV2(**model_configs[encoder])
+    maybe_load_state_dict(model, filepath)
     model.to(dev)
 
     if channels_last and dev.type == "cuda":
